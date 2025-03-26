@@ -1,0 +1,41 @@
+plugins {
+    id "java"
+    id "application"
+}
+
+group = "agency.highlysuspect"
+version = "1.0-SNAPSHOT"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+//    testImplementation platform("org.junit:junit-bom:5.10.0")
+//    testImplementation "org.junit.jupiter:junit-jupiter"
+    implementation "org.ow2.asm:asm:9.7.1"
+    implementation "com.google.code.gson:gson:2.12.1"
+}
+
+application {
+    mainClass = "agency.highlysuspect.declarationofindependence.DeclarationOfIndependence"
+}
+
+//test {
+//    useJUnitPlatform()
+//}
+
+tasks.register('fat', Jar) {
+    group "build"
+    
+    manifest {
+        attributes "Main-Class": project.application.mainClass
+        attributes "Implementation-Version": project.version
+    }
+    archiveClassifier = "all"
+    from {
+        configurations.runtimeClasspath.collect {it.isDirectory() ? it : zipTree(it)}
+    }
+    duplicatesStrategy = DuplicatesStrategy.WARN
+    with jar
+}
