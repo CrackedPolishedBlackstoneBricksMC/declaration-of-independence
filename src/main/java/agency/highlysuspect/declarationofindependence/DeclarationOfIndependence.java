@@ -1,6 +1,7 @@
 package agency.highlysuspect.declarationofindependence;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import org.objectweb.asm.*;
@@ -17,53 +18,96 @@ import java.util.zip.ZipInputStream;
 public class DeclarationOfIndependence {
 	public static void main(String[] args) throws Exception {
 		
-		List<Mod> mods = new ArrayList<>(args.length);
+		List<Mod> jars = new ArrayList<>(args.length);
 		
 		try {
 			for(String arg : args) {
 				Path path = Paths.get(arg);
 				ZipInputStream zin = new ZipInputStream(Files.newInputStream(path));
 				Mod mod = new Mod(zin, path.getFileName().toString(), null);
-				mods.add(mod);
+				jars.add(mod);
 			}
 			
 			//parse all mods; "newMods" holds discovered nested jijs
-			List<Mod> modsToParse = new ArrayList<>(mods);
-			while(!modsToParse.isEmpty()) {
-				System.out.println("parsing " + modsToParse.size() + " mods");
-				List<Mod> newMods = new ArrayList<>();
-				for(Mod mod : modsToParse) mod.parse(newMods::add);
-				mods.addAll(newMods);
-				modsToParse = newMods;
+			List<Mod> jarsToParse = new ArrayList<>(jars);
+			List<Mod> mods = new ArrayList<>();
+			while(!jarsToParse.isEmpty()) {
+				System.out.println("parsing " + jarsToParse.size() + " jars");
+				List<Mod> newJars = new ArrayList<>();
+				for(Mod mod : jarsToParse) {
+					mod.parse(newJars::add);
+					
+					//was this actually a mod? (contained fmj)
+					if(mod.modids.isEmpty()) {
+						System.out.println(mod.path + " is not a known mod type");
+					} else mods.add(mod);
+				}
+				jarsToParse = newJars;
 			}
 			
-			mods.removeIf(mod -> {
-				if(mod.modid == null) {
-					System.out.println(mod.path + " is not a mod");
-					return true;
+			for(Mod mod : mods) mod.addImplicitJijDeps();
+			
+			System.out.println("total mods: " + mods.size());
+			
+			//deduplicate
+			Set<String> modids = new HashSet<>();
+			for(Mod mod : mods) modids.addAll(mod.modids);
+			//TODO pick the one with the highest version/or match fabric's resolver
+			List<Mod> dedupeMods = new ArrayList<>(modids.size());
+			for(String modid : modids) dedupeMods.add(mods.stream().filter(it -> it.modids.contains(modid)).findFirst().get());
+			
+			System.out.println("deduplicated: " + dedupeMods.size());
+			
+			//transitive deps (TODO this algorithm is trash lol)
+			Map<String, Mod> modsById = new HashMap<>();
+			for(Mod mod : mods) for(String id : mod.modids) modsById.put(id, mod);
+			boolean didAnything;
+			do {
+				didAnything = false;
+				System.out.println("transitive deps pass...");
+				for(Mod mod : mods) {
+					for(String dep : new HashSet<>(mod.deps)) {
+						Mod depMod = modsById.get(dep);
+						if(depMod == null) continue;
+						
+						for(String depModDep : depMod.deps) {
+							if(mod.deps.add(depModDep)) {
+								didAnything = true;
+//								System.out.println("added transitive " + depModDep + " to " + mod.displayId());
+							}
+						}
+						
+						//also fill out aliases
+						for(String depModAlias : depMod.modids) {
+							if(mod.deps.add(depModAlias)) {
+								didAnything = true;
+//								System.out.println("added transitive " + depModAlias + " to " + mod.displayId());
+							}
+						}
+					}
 				}
-				return false;
-			});
+			} while(didAnything);
 			
 			//who defines what?
 			Map<String, List<Mod>> whoDefinesWhat = new HashMap<>();
-			for(Mod mod : mods)
+			for(Mod mod : dedupeMods)
 				for(String def : mod.definedClasses)
 					whoDefinesWhat.computeIfAbsent(def, __ -> new ArrayList<>(2)).add(mod);
 			
+			System.out.println(whoDefinesWhat.keySet().size() + " total classes");
+			
 			//check that all usages are declared
-			for(Mod mod : mods)
+			for(Mod mod : dedupeMods)
 				for(String use : mod.usedClasses)
 					for(Mod definingMod : whoDefinesWhat.getOrDefault(use, List.of()))
-						if(mod.deps.contains(definingMod.modid)) {
+						for(String definingModId : definingMod.modids)
+							if(mod.deps.contains(definingModId)) {
 //							System.out.println("mod " + mod.modid + " uses class " + use + " from " + definingMod.modid);
 						} else {
-							System.out.println("UNDECLARED mod " + mod.modid + " uses class " + use + " from " + definingMod.modid);
+							System.out.println("UNDECLARED mod " + mod.displayId() + " uses class " + use + " from " + definingMod.displayId());
 						}
 		} finally {
-			for(Mod mod : mods) {
-				mod.close();
-			}
+			for(Mod mod : jars) mod.close();
 		}
 	}
 }
@@ -78,14 +122,20 @@ class Mod implements Closeable {
 	final ZipInputStream zin;
 	final Mod parent;
 	final String path;
-	String modid;
+	final Set<String> modids = new HashSet<>(); //including aliases / "provides"
 	final Set<String> deps = new HashSet<>();
 	final Set<String> definedClasses = new HashSet<>();
 	final Set<String> usedClasses = new HashSet<>();
 	
+	private List<Mod> nestedMods = new ArrayList<>();
+	
 	@Override
 	public void close() throws IOException {
 		zin.close();
+	}
+	
+	public String displayId() {
+		return String.join(",", modids);
 	}
 	
 	void parse(Consumer<Mod> moreMods) throws IOException {
@@ -106,6 +156,7 @@ class Mod implements Closeable {
 				Mod subMod = new Mod(sub, this.path + "!" + e.getName(), this);
 				moreMods.accept(subMod);
 				subMod.parse(moreMods);
+				nestedMods.add(subMod);
 				continue;
 			}
 			
@@ -114,7 +165,7 @@ class Mod implements Closeable {
 				JsonObject fmj = new Gson().fromJson(new InputStreamReader(zin), JsonObject.class);
 				JsonElement modidE = fmj.get("id");
 				if(modidE == null || !modidE.isJsonPrimitive()) continue;
-				modid = modidE.getAsString();
+				modids.add(modidE.getAsString());
 				
 				JsonElement dependsE = fmj.get("depends");
 				if(dependsE != null) {
@@ -122,12 +173,27 @@ class Mod implements Closeable {
 					deps.addAll(depends.keySet());
 				}
 				
-				System.out.println(path + " is " + modid + ", deps: " + String.join(", ", deps));
+				JsonElement providesE = fmj.get("provides");
+				if(providesE != null) {
+					JsonArray provides = providesE.getAsJsonArray();
+					modids.addAll(provides.asList().stream().map(JsonElement::getAsString).toList());
+				}
+				
+//				System.out.println(path + " is " + modid + ", deps: " + String.join(", ", deps));
 			}
 		}
 		
 		//if you define a class yourself, you're allowed to use it
 		usedClasses.removeAll(definedClasses);
+	}
+	
+	void addImplicitJijDeps() {
+		for(Mod nested : nestedMods) {
+			if(nested.modids.isEmpty()) continue;
+			System.out.println("implicit dep: " + nested.displayId() + " <-> " + displayId());
+			nested.deps.addAll(modids);
+			deps.addAll(nested.modids);
+		}
 	}
 	
 	private void useDesc(String desc) {
