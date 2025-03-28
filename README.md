@@ -4,4 +4,4 @@
 
 Current status: quick hack written while not paying attention in class
 
-TODO: doesn't handle jar-in-jars, doesn't compute transitive deps, still missing some usages
+TODO: doesn't compute transitive deps, doesn't really work yet

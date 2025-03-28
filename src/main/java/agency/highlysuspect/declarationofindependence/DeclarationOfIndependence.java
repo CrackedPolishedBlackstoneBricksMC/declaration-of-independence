@@ -6,11 +6,13 @@ import com.google.gson.JsonObject;
 import org.objectweb.asm.*;
 
 import java.io.*;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 
 public class DeclarationOfIndependence {
 	public static void main(String[] args) throws Exception {
@@ -19,20 +21,29 @@ public class DeclarationOfIndependence {
 		
 		try {
 			for(String arg : args) {
-				ZipFile zf = new ZipFile(Paths.get(arg).toAbsolutePath().toFile());
-				Mod mod = modOrNull(zf);
-				
-				if(mod == null) {
-					System.out.println("not a mod: " + zf.getName());
-					zf.close();
-					continue;
-				}
-				
+				Path path = Paths.get(arg);
+				ZipInputStream zin = new ZipInputStream(Files.newInputStream(path));
+				Mod mod = new Mod(zin, path.getFileName().toString(), null);
 				mods.add(mod);
 			}
 			
-			//parse all mods
-			for(Mod mod : mods) mod.parse();
+			//parse all mods; "newMods" holds discovered nested jijs
+			List<Mod> modsToParse = new ArrayList<>(mods);
+			while(!modsToParse.isEmpty()) {
+				System.out.println("parsing " + modsToParse.size() + " mods");
+				List<Mod> newMods = new ArrayList<>();
+				for(Mod mod : modsToParse) mod.parse(newMods::add);
+				mods.addAll(newMods);
+				modsToParse = newMods;
+			}
+			
+			mods.removeIf(mod -> {
+				if(mod.modid == null) {
+					System.out.println(mod.path + " is not a mod");
+					return true;
+				}
+				return false;
+			});
 			
 			//who defines what?
 			Map<String, List<Mod>> whoDefinesWhat = new HashMap<>();
@@ -49,66 +60,69 @@ public class DeclarationOfIndependence {
 						} else {
 							System.out.println("UNDECLARED mod " + mod.modid + " uses class " + use + " from " + definingMod.modid);
 						}
-			
-			//report results
-			//for(Mod mod : mods) mod.show();
 		} finally {
 			for(Mod mod : mods) {
 				mod.close();
 			}
 		}
 	}
-	
-	private static Mod modOrNull(ZipFile zf) throws IOException {
-		ZipEntry fmjEntry = zf.getEntry("fabric.mod.json");
-		if(fmjEntry == null) return null;
-		
-		try(Reader fmjStreamReader = new InputStreamReader(zf.getInputStream(fmjEntry), StandardCharsets.UTF_8)) {
-			JsonObject fmj = new Gson().fromJson(fmjStreamReader, JsonObject.class);
-//			System.out.println(fmj);
-			JsonElement modidE = fmj.get("id");
-			if(modidE == null || !modidE.isJsonPrimitive()) return null;
-			
-			Set<String> deps = new HashSet<>();
-			JsonElement dependsE = fmj.get("depends");
-			if(dependsE != null) {
-				JsonObject depends = dependsE.getAsJsonObject();
-				deps.addAll(depends.keySet());
-			}
-			
-			String modid = modidE.getAsString();
-			return new Mod(modid, deps, zf);
-		}
-	}
 }
 
 class Mod implements Closeable {
-	public Mod(String modid, Set<String> deps, ZipFile zf) {
-		this.modid = modid;
-		this.deps = deps;
-		this.zf = zf;
+	public Mod(ZipInputStream zin, String path, Mod parent) {
+		this.zin = zin;
+		this.path = path;
+		this.parent = parent;
 	}
 	
-	final String modid;
-	final Set<String> deps;
-	final ZipFile zf;
+	final ZipInputStream zin;
+	final Mod parent;
+	final String path;
+	String modid;
+	final Set<String> deps = new HashSet<>();
 	final Set<String> definedClasses = new HashSet<>();
 	final Set<String> usedClasses = new HashSet<>();
 	
 	@Override
 	public void close() throws IOException {
-		zf.close();
+		zin.close();
 	}
 	
-	void parse() throws IOException {
-		System.out.println("parsing " + zf.getName());
-		
-		for(ZipEntry e : new Enumeratorable<>(zf.entries())) {
+	void parse(Consumer<Mod> moreMods) throws IOException {
+		ZipEntry e;
+		while((e = zin.getNextEntry()) != null) {
+			if(e.isDirectory()) continue;
+			
+			//class
 			if(e.getName().endsWith(".class") && !e.getName().endsWith("module-info.class")) {
-				try(InputStream in = zf.getInputStream(e)) {
-					ClassReader reader = new ClassReader(in.readAllBytes());
-					reader.accept(new Visitor(), 0);
+				ClassReader reader = new ClassReader(zin.readAllBytes());
+				reader.accept(new Visitor(), 0);
+				continue;
+			}
+			
+			//nested jar
+			if(e.getName().endsWith(".jar")) {
+				ZipInputStream sub = new ZipInputStream(zin);
+				Mod subMod = new Mod(sub, this.path + "!" + e.getName(), this);
+				moreMods.accept(subMod);
+				subMod.parse(moreMods);
+				continue;
+			}
+			
+			//metadata
+			if(e.getName().equals("fabric.mod.json")) {
+				JsonObject fmj = new Gson().fromJson(new InputStreamReader(zin), JsonObject.class);
+				JsonElement modidE = fmj.get("id");
+				if(modidE == null || !modidE.isJsonPrimitive()) continue;
+				modid = modidE.getAsString();
+				
+				JsonElement dependsE = fmj.get("depends");
+				if(dependsE != null) {
+					JsonObject depends = dependsE.getAsJsonObject();
+					deps.addAll(depends.keySet());
 				}
+				
+				System.out.println(path + " is " + modid + ", deps: " + String.join(", ", deps));
 			}
 		}
 		
@@ -116,20 +130,12 @@ class Mod implements Closeable {
 		usedClasses.removeAll(definedClasses);
 	}
 	
-	void show() {
-		for(String def : definedClasses) System.out.println("Mod " + modid + " defines " + def);
-		for(String use : usedClasses) System.out.println("Mod " + modid + " uses " + use);
-		System.out.println();
-	}
-	
 	private void useDesc(String desc) {
 		int l = 0;
 		while((l = desc.indexOf('L', l)) != -1) {
 			int semi = desc.indexOf(';', l);
 			if(semi == -1) throw new IllegalArgumentException(desc);
-			String aawawaw = desc.substring(l + 1, semi);
-			//System.out.println("DESC " + aawawaw);
-			usedClasses.add(aawawaw);
+			usedClasses.add(desc.substring(l + 1, semi));
 			l = semi;
 		}
 	}
@@ -197,18 +203,5 @@ class Mod implements Closeable {
 		public void visitLdcInsn(Object value) {
 			if(value instanceof Type t && t.getSort() == Type.OBJECT) useDesc(t.getDescriptor());
 		}
-	}
-}
-
-class Enumeratorable<T> implements Iterable<T> {
-	public Enumeratorable(Enumeration<T> e) {
-		this.e = e;
-	}
-	
-	private final Enumeration<T> e;
-	
-	@Override
-	public Iterator<T> iterator() {
-		return e.asIterator();
 	}
 }
