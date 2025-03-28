@@ -24,8 +24,7 @@ public class DeclarationOfIndependence {
 			for(String arg : args) {
 				Path path = Paths.get(arg);
 				ZipInputStream zin = new ZipInputStream(Files.newInputStream(path));
-				Mod mod = new Mod(zin, path.getFileName().toString(), null);
-				jars.add(mod);
+				jars.add(new Mod(zin, path.getFileName().toString(), null));
 			}
 			
 			//parse all mods; "newMods" holds discovered nested jijs
@@ -45,6 +44,7 @@ public class DeclarationOfIndependence {
 				jarsToParse = newJars;
 			}
 			
+			//do this afterwards (no guarantee we know the modid by the time we find jij mods)
 			for(Mod mod : mods) mod.addImplicitJijDeps();
 			
 			System.out.println("total mods: " + mods.size());
@@ -127,7 +127,7 @@ class Mod implements Closeable {
 	final Set<String> definedClasses = new HashSet<>();
 	final Set<String> usedClasses = new HashSet<>();
 	
-	private List<Mod> nestedMods = new ArrayList<>();
+	private final List<Mod> nestedMods = new ArrayList<>();
 	
 	@Override
 	public void close() throws IOException {
